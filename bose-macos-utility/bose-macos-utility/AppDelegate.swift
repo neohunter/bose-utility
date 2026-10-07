@@ -1,283 +1,306 @@
-//
-//  AppDelegate.swift
-//  bose-macos-utility
-//
-//  Created by Łukasz Zalewski on 23/06/2021.
-//
-
 import Cocoa
 import IOBluetooth
+import OSLog
 
-// TODO: add documentation to each method
 @main
-class AppDelegate: NSObject, NSApplicationDelegate {
-    // Keep a reference to the status bar item to keep it alive throughout the whole lifetime of the application
+class AppDelegate: NSObject, NSApplicationDelegate, IOBluetoothRFCOMMChannelDelegate {
     var statusBarItem: NSStatusItem!
-    var statusBarMenu: NSMenu!
-    var selectDeviceMenu: NSMenu!
-    var pairedDevices: [IOBluetoothDevice] = []
+    let headphonesMenu = NSMenu()
+    let sourcesMenu = NSMenu()
+    let noiseMenu = NSMenu()
     var channel: IOBluetoothRFCOMMChannel?
-    
-    func applicationDidFinishLaunching(_ aNotification: Notification) {
-        // We need to setup the status bar first, since we want to add the paired devices to it in the second call
-        setupStatusBar()
-        setupConnectionToHeadphones()
+    var parser = BoseProtocol()
+    var sources: [BoseSource] = []
+    var expectedAddresses: [[UInt8]] = []
+    var timeout: Timer?
+    var pending: (command: UInt8, address: [UInt8])?
+    var connecting = false
+    var selectedDevice: IOBluetoothDevice?
+    var connectionState = "Not connected"
+    let logger = OSLog(subsystem: "lukasz-zet.bose-macos-utility", category: "Connection")
+
+    func log(_ message: String) {
+        os_log("%{public}@", log: logger, type: .default, message)
     }
 
-    func applicationWillTerminate(_ aNotification: Notification) {
-        // Insert code here to tear down your application
+    func updateSelection(_ state: String) {
+        connectionState = state
+        statusBarItem.button?.toolTip = selectedDevice.map { "\($0.nameOrAddress ?? "Bose"): \(state)" } ?? state
+        for item in headphonesMenu.items {
+            guard let device = item.representedObject as? IOBluetoothDevice else { continue }
+            let selected = device.addressString == selectedDevice?.addressString
+            item.state = selected ? .on : .off
+            item.title = (device.nameOrAddress ?? "Unknown device") + (selected ? " — \(state)" : "")
+        }
+        log("Connection state: \(state)")
     }
-}
 
-// MARK: - Menu app construction methods
-extension AppDelegate {
-    private func setupStatusBar() {
-        // Initalize the menu bar extra
-        let statusBar = NSStatusBar.system
-        
-        let statusBarItem = statusBar.statusItem(withLength: NSStatusItem.squareLength)
-        self.statusBarItem = statusBarItem
-        // TODO: use the template image, so that the icon is changed when the dark/light mode settings change
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        statusBarItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         statusBarItem.button?.title = "🎧"
-        let statusBarMenu = NSMenu()
-        statusBarMenu.showsStateColumn = true
-        statusBarMenu.autoenablesItems = false
-        self.statusBarMenu = statusBarMenu
-        statusBarItem.menu = statusBarMenu
-        
-        // Add the noise cancellation item
-        let noiseCancellationMenu = NSMenuItem()
-        noiseCancellationMenu.title = "Noise cancellation"
-        statusBarMenu.addItem(noiseCancellationMenu)
-        
-        // Add the select target device item
-        let selectDeviceMenu = NSMenuItem()
-        selectDeviceMenu.title = "Select target device"
-        statusBarMenu.addItem(selectDeviceMenu)
-        
-        // Create the noise cancellation submenu
-        let ncSubmenu = NSMenu()
-        ncSubmenu.autoenablesItems = false
-        let ncOffItem = NSMenuItem(title: "Off",
-                                   action: #selector(noiseCancellationOff),
-                                   keyEquivalent: "")
-        let ncMediumItem = NSMenuItem(title: "Medium",
-                                      action: #selector(noiseCancellationMedium),
-                                      keyEquivalent: "")
-        let ncHighItem = NSMenuItem(title: "High",
-                                    action: #selector(noiseCancellationHigh),
-                                    keyEquivalent: "")
-        
-        ncSubmenu.addItem(ncOffItem)
-        ncSubmenu.addItem(ncMediumItem)
-        ncSubmenu.addItem(ncHighItem)
-        
-        // Create the select device submenu
-        let selectDeviceSubmenu = NSMenu()
-        selectDeviceSubmenu.delegate = self
-        self.selectDeviceMenu = selectDeviceSubmenu
-        selectDeviceSubmenu.autoenablesItems = false
-        let refreshButton = NSMenuItem(title: "Refresh...",
-                                       action: #selector(refreshPairedDevicesList),
-                                       keyEquivalent: "")
-        refreshButton.isAlternate = true
-        
-        selectDeviceSubmenu.addItem(refreshButton)
-    
-        // Set the appropriate submenus
-        noiseCancellationMenu.submenu = ncSubmenu
-        selectDeviceMenu.submenu = selectDeviceSubmenu
-        
-        // Add the Quit item
-        statusBarMenu.addItem(withTitle: "Quit",
-                              action: #selector(quit),
-                              keyEquivalent: "")
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        for (title, submenu) in [("Select headphones", headphonesMenu),
+                                  ("Headphone connections", sourcesMenu),
+                                  ("Noise cancellation", noiseMenu)] {
+            let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+            item.submenu = submenu
+            submenu.autoenablesItems = false
+            menu.addItem(item)
+        }
+        for (title, value) in [("Off", 0), ("Medium", 3), ("High", 1)] {
+            let item = actionItem(title, #selector(changeNoise(_:)))
+            item.tag = value
+            noiseMenu.addItem(item)
+        }
+        menu.addItem(.separator())
+        menu.addItem(actionItem("About Bose Utility", #selector(showAbout)))
+        menu.addItem(actionItem("Quit", #selector(quit)))
+        headphonesMenu.showsStateColumn = true
+        statusBarItem.menu = menu
+        refreshHeadphones()
+        showStatus("Select your Bose headphones first")
+        // Reuse the control host's already connected Bose; do not change source connections.
+        let connectedBose = headphonesMenu.items.filter {
+            guard let device = $0.representedObject as? IOBluetoothDevice else { return false }
+            return device.isConnected() && (device.name ?? "").localizedCaseInsensitiveContains("bose")
+        }
+        if connectedBose.count == 1 {
+            DispatchQueue.main.async { self.selectHeadphones(connectedBose[0]) }
+        }
     }
-}
 
-// MARK: - Bluetooth specific methods
-extension AppDelegate {
-    private func setupConnectionToHeadphones() {
-        // Get all the paired devices
-        guard let devices = IOBluetoothDevice.pairedDevices() as? [IOBluetoothDevice] else {
-            print("No paired devices found")
-            return
+    func actionItem(_ title: String, _ action: Selector) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+        item.target = self
+        return item
+    }
+
+    func showStatus(_ text: String) {
+        log("Status: \(text)")
+        sourcesMenu.removeAllItems()
+        let item = NSMenuItem(title: text, action: nil, keyEquivalent: "")
+        item.isEnabled = false
+        sourcesMenu.addItem(item)
+        sourcesMenu.addItem(actionItem("Refresh connections", #selector(refreshConnections)))
+    }
+
+    @objc func refreshHeadphones() {
+        headphonesMenu.removeAllItems()
+        headphonesMenu.addItem(actionItem("Refresh headphones", #selector(refreshHeadphones)))
+        headphonesMenu.addItem(.separator())
+        let devices = IOBluetoothDevice.pairedDevices() as? [IOBluetoothDevice] ?? []
+        for device in devices {
+            let item = actionItem(device.nameOrAddress ?? "Unknown device", #selector(selectHeadphones(_:)))
+            item.representedObject = device
+            headphonesMenu.addItem(item)
         }
-        
-        if devices.isEmpty {
-            print("No paired devices found")
-            return
-        }
-        
-        // Add a separator item
-        let separatorItem = NSMenuItem.separator()
-        self.selectDeviceMenu.addItem(separatorItem)
-        
-        // Append the found devices to the list
-        self.pairedDevices.append(contentsOf: devices)
-        
-        // Set up the initial menus
-        devices.forEach { device in
-            let deviceItem = NSMenuItem(title: device.nameOrAddress ?? "unknown",
-                                        action: #selector(deviceSelected(sender:)),
-                                        keyEquivalent: "")
-            deviceItem.indentationLevel = 1
-            deviceItem.title = device.nameOrAddress ?? "unknown"
-            self.selectDeviceMenu.addItem(deviceItem)
+        updateSelection(connectionState)
+    }
+
+    @objc func selectHeadphones(_ sender: NSMenuItem) {
+        guard !connecting, let device = sender.representedObject as? IOBluetoothDevice else { return }
+        connecting = true
+        timeout?.invalidate()
+        pending = nil
+        channel?.setDelegate(nil)
+        channel?.close()
+        channel = nil
+        parser = BoseProtocol()
+        sources = []
+        selectedDevice = device
+        updateSelection("Connecting…")
+        showStatus("Looking up Bose Bluetooth services…")
+        startTimeout("Bluetooth service lookup timed out; select headphones again")
+        let result = device.performSDPQuery(self)
+        log("SDP started: \(result)")
+        if result != kIOReturnSuccess {
+            connecting = false
+            timeout?.invalidate()
+            updateSelection("Connection failed")
+            showStatus("Bluetooth service lookup failed (\(result))")
         }
     }
-    
-    func connectToDevice(with name: String) -> Bool {
-        guard let device = self.pairedDevices.first(where: { $0.name == name }) else {
-            print("Could not find the selected device")
+
+    @objc func sdpQueryComplete(_ device: IOBluetoothDevice!, status: IOReturn) {
+        guard let device = device, connecting,
+              device.addressString == selectedDevice?.addressString else { return }
+        log("SDP completed: \(status)")
+        timeout?.invalidate()
+        guard status == kIOReturnSuccess,
+              let services = device.services as? [IOBluetoothSDPServiceRecord],
+              let service = services.first(where: { $0.getServiceName() == "SPP Dev" })
+                ?? services.first(where: { $0.matchesUUID16(0x1101) }) else {
+            connecting = false
+            updateSelection("Connection failed")
+            showStatus(status == kIOReturnSuccess ? "No compatible Bose service found" : "Bluetooth lookup failed (\(status))")
+            return
+        }
+        log("Bose service found by name or Serial Port UUID")
+        var id: BluetoothRFCOMMChannelID = 0
+        guard service.getRFCOMMChannelID(&id) == kIOReturnSuccess else {
+            connecting = false
+            updateSelection("Connection failed")
+            showStatus("Cannot find the Bose control channel")
+            return
+        }
+        var opened: IOBluetoothRFCOMMChannel?
+        let result = device.openRFCOMMChannelSync(&opened, withChannelID: id, delegate: self)
+        log("RFCOMM open: \(result)")
+        connecting = false
+        guard result == kIOReturnSuccess, let opened = opened else {
+            updateSelection("Connection failed")
+            showStatus("Control connection failed (\(result)); reconnect headphones")
+            return
+        }
+        channel = opened
+        // Initialize the BMAP control session, then request the saved sources.
+        updateSelection("Connected")
+        showStatus("Initializing Bose control session…")
+        startTimeout("Bose control session did not respond; select headphones again")
+        if !send([0, 1, 1, 0]) { timeout?.invalidate() }
+    }
+
+    @discardableResult func send(_ bytes: [UInt8]) -> Bool {
+        guard let channel = channel, channel.isOpen() else {
+            showStatus("Headphones disconnected; select them again")
             return false
         }
-        
-        var ret: IOReturn!
-        ret = device.performSDPQuery(self, uuids: [])
-        
-        if ret != kIOReturnSuccess {
-            fatalError("SDP Query unsuccessful")
+        var bytes = bytes
+        let count = UInt16(bytes.count)
+        log("Sending group \(bytes[0]), command \(bytes[1])")
+        let result = bytes.withUnsafeMutableBytes { channel.writeSync($0.baseAddress!, length: count) }
+        log("Bluetooth write result: \(result), MTU: \(channel.getMTU())")
+        guard result == kIOReturnSuccess else {
+            showStatus("Bluetooth command failed (\(result)); refresh or reconnect")
+            return false
         }
-        
-        // Check if the device contains the required service.
-        // Only if SPP Dev is available, these are probably the right headphones
-        guard let services = device.services as? [IOBluetoothSDPServiceRecord],
-            let serviceHeadset = services.first(where: { service -> Bool in
-                service.getServiceName() == "SPP Dev"
-            }) else {
-                print("Could not find the required service.")
-                return false
-        }
-        
-        // Prepare to open an rfcomm channel to the headphones
-        // Channel Id always comes in a sequence 8 8 9 9 8 8 9 9 ... -> in this context it is irrelevant
-        var channelId: BluetoothRFCOMMChannelID = BluetoothRFCOMMChannelID()
-        serviceHeadset.getRFCOMMChannelID(&channelId) // Add a check for the returned value later
-        
-        // Open a rfcomm channel to the headset
-        // Headphones use the "SPP Dev" service to provide information for the app on iOS devices, we can use the same one here
-        var channel: IOBluetoothRFCOMMChannel? = nil
-        
-        let ret2 = device.openRFCOMMChannelSync(&channel,
-                                                withChannelID: channelId,
-                                                delegate: self)
-        
-        // Set the reference for later
-        self.channel = channel
-        if ret2 != kIOReturnSuccess {
-            fatalError("Failed to open an rfcomm channel")
-        }
-        
-        IOBluetoothRFCOMMChannel.register(forChannelOpenNotifications: self,
-                                          selector: #selector(newRFCOMMChannelOpened),
-                                          withChannelID: channelId,
-                                          direction: kIOBluetoothUserNotificationChannelDirectionIncoming)
-        
-        // If everything went okay, return true
         return true
     }
-    
-    @objc func newRFCOMMChannelOpened(userNotification: IOBluetoothUserNotification,
-                                      channel: IOBluetoothRFCOMMChannel) {
-        print("New channel opened: \(channel.getID()), isOpen: \(channel.isOpen()), isIncoming: \(channel.isIncoming())")
-        channel.setDelegate(self)
-    }
-}
 
-// MARK: - RFCOMMChannel delegate methods
-extension AppDelegate: IOBluetoothRFCOMMChannelDelegate {
-    
-}
+    func startTimeout(_ message: String) {
+        timeout?.invalidate()
+        timeout = Timer(timeInterval: 12, repeats: false) { [weak self] _ in
+            self?.connecting = false
+            if self?.channel == nil { self?.updateSelection("Connection failed") }
+            self?.pending = nil
+            self?.showStatus(message)
+        }
+        RunLoop.main.add(timeout!, forMode: .common)
+    }
 
-// MARK: - Menu item selection handlers
-extension AppDelegate {
-    @objc func quit() {
-        print("Quitting the menu...")
-        self.statusBarMenu.cancelTracking()
-        exit(-1)
+    @objc func refreshConnections() {
+        guard pending == nil else { return }
+        sources = []
+        expectedAddresses = []
+        showStatus("Reading headphone connections…")
+        startTimeout("No response; refresh or reconnect your headphones")
+        if !send([4, 4, 1, 0]) { timeout?.invalidate() }
     }
-    
-    @objc func noiseCancellationOff() {
-        print("Turning the noise cancellation off")
-        var data: [UInt8] = [0x01, 0x06, 0x02, 0x01, 0x00]
-        // If the channel is open send the appropriate data on it. How did I figure out what to send? Check README.md for information
-        if let isOpen = self.channel?.isOpen(), isOpen {
-            var result: [UInt8] = []
-            let ret = channel?.writeAsync(&data, length: UInt16(data.count), refcon: &result)
-            print(krToString(ret!))
-        } else {
-            print("The channel is not open")
-        }
+
+    func rfcommChannelData(_ rfcommChannel: IOBluetoothRFCOMMChannel!, data dataPointer: UnsafeMutableRawPointer!, length dataLength: Int) {
+        guard let rfcommChannel = rfcommChannel, rfcommChannel === channel,
+              let dataPointer = dataPointer, dataLength > 0 else { return }
+        let bytes = Array(UnsafeBufferPointer(start: dataPointer.assumingMemoryBound(to: UInt8.self), count: dataLength))
+        // IOBluetooth delivers callbacks on the application's run loop.
+        for frame in parser.receive(bytes) { handle(frame) }
     }
-    
-    @objc func noiseCancellationMedium() {
-        print("Turning the noise cancellation to medium setting")
-        var data: [UInt8] = [0x01, 0x06, 0x02, 0x01, 0x03]
-        if let isOpen = self.channel?.isOpen(), isOpen {
-            var result: [UInt8] = []
-            let ret = channel?.writeAsync(&data, length: UInt16(data.count), refcon: &result)
-            print(krToString(ret!))
-        } else {
-            print("The channel is not open")
-        }
-    }
-    
-    @objc func noiseCancellationHigh() {
-        print("Turning the noise cancellation to high setting")
-        var data: [UInt8] = [0x01, 0x06, 0x02, 0x01, 0x01]
-        if let isOpen = self.channel?.isOpen(), isOpen {
-            var result: [UInt8] = []
-            let ret = channel?.writeAsync(&data, length: UInt16(data.count), refcon: &result)
-            print(krToString(ret!))
-        } else {
-            print("The channel is not open")
-        }
-    }
-    
-    @objc func refreshPairedDevicesList() {
-        guard let devices = IOBluetoothDevice.pairedDevices() as? [IOBluetoothDevice] else {
-            print("No paired devices found")
+
+    func handle(_ frame: BoseFrame) {
+        log("Received group \(frame.group), command \(frame.command), kind \(frame.kind), length \(frame.payload.count)")
+        if frame.group == 0, frame.command == 1, frame.kind == 3 {
+            timeout?.invalidate()
+            refreshConnections()
             return
         }
-        
-        devices.forEach { device in
-            let deviceItem = NSMenuItem(title: device.name, action: #selector(deviceSelected(sender:)), keyEquivalent: "")
-            deviceItem.title = device.name
-            self.selectDeviceMenu.addItem(deviceItem)
+        guard frame.group == 4 else { return }
+        if let action = pending, frame.command == action.command,
+           frame.kind == 7, frame.payload == action.address {
+            pending = nil
+            timeout?.invalidate()
+            refreshConnections()
+        } else if frame.command == 4, frame.kind == 3,
+                  let addresses = BoseProtocol.addresses(frame.payload) {
+            expectedAddresses = addresses
+            sources = []
+            if addresses.isEmpty {
+                timeout?.invalidate()
+                showStatus("No saved devices reported by headphones")
+            } else {
+                for address in addresses { _ = send([4, 5, 1, 6] + address) }
+            }
+        } else if frame.command == 5, frame.kind == 3,
+                  let source = BoseSource.parse(frame.payload),
+                  expectedAddresses.contains(source.address) {
+            sources.removeAll { $0.address == source.address }
+            sources.append(source)
+            renderSources()
+            if sources.count == expectedAddresses.count { timeout?.invalidate() }
         }
     }
-    
-    @objc func deviceSelected(sender: Any) {
-        guard let senderItem = sender as? NSMenuItem else {
-            print("Invalid sender. Something went wrong")
-            return
-        }
-        
-        // Connect to the device with a name that is equal to the sender title
-        if self.connectToDevice(with: senderItem.title) {
-            print("Successfully connected to the Bose headphones")
-        } else {
-            print("Something went wrong")
-        }
-    }
-    
-    func krToString (_ kr: kern_return_t) -> String {
-        if let cStr = mach_error_string(kr) {
-            return String (cString: cStr)
-        } else {
-            return "Unknown kernel error \(kr)"
-        }
-    }
-}
 
-extension AppDelegate: NSMenuDelegate {
-    func menuWillOpen(_ menu: NSMenu) {
-        // TODO: called when user clicks the icon on the status bar
-        
+    func renderSources() {
+        sourcesMenu.removeAllItems()
+        for source in sources {
+            let connected = source.status == 1 || source.status == 3
+            let known = [UInt8(0), 1, 3].contains(source.status)
+            let suffix = source.status == 3 ? " (this Mac)" : (connected ? " (connected)" : (known ? "" : " (unknown state)"))
+            let item = NSMenuItem(title: source.name + suffix, action: nil, keyEquivalent: "")
+            item.state = connected ? .on : .off
+            let submenu = NSMenu()
+            submenu.autoenablesItems = false
+            let action = actionItem(connected ? "Disconnect" : "Connect", #selector(changeConnection(_:)))
+            action.representedObject = source
+            action.isEnabled = known && pending == nil
+            submenu.addItem(action)
+            item.submenu = submenu
+            sourcesMenu.addItem(item)
+        }
+        if sources.count < expectedAddresses.count {
+            let item = NSMenuItem(title: "Reading remaining devices…", action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            sourcesMenu.addItem(item)
+        }
+        sourcesMenu.addItem(.separator())
+        sourcesMenu.addItem(actionItem("Refresh connections", #selector(refreshConnections)))
     }
-    
-    func menuDidClose(_ menu: NSMenu) {
-        
+
+    @objc func changeConnection(_ sender: NSMenuItem) {
+        guard pending == nil, let source = sender.representedObject as? BoseSource else { return }
+        let connected = source.status == 1 || source.status == 3
+        let packet = connected ? BoseProtocol.disconnect(source.address) : BoseProtocol.connect(source.address)
+        guard let packet = packet else { return }
+        pending = (connected ? 2 : 1, source.address)
+        showStatus(connected ? "Disconnecting \(source.name)…" : "Connecting to \(source.name)…")
+        startTimeout("Change not confirmed; refresh connections")
+        if !send(packet) { pending = nil; timeout?.invalidate() }
+    }
+
+    func rfcommChannelClosed(_ rfcommChannel: IOBluetoothRFCOMMChannel!) {
+        guard let rfcommChannel = rfcommChannel, rfcommChannel === channel else { return }
+        timeout?.invalidate()
+        pending = nil
+        channel = nil
+        updateSelection("Disconnected")
+        showStatus("Control connection closed; select headphones again")
+    }
+
+    @objc func changeNoise(_ sender: NSMenuItem) {
+        _ = send([1, 6, 2, 1, UInt8(sender.tag)])
+    }
+    @objc func showAbout() {
+        NSApp.activate(ignoringOtherApps: true)
+        NSApp.orderFrontStandardAboutPanel(options: [
+            .applicationName: "Bose Utility",
+            .applicationVersion: "1.0",
+            .credits: NSAttributedString(string: "Created by Arnold Roa\n\nBose is a trademark of Bose Corporation.")
+        ])
+    }
+
+    @objc func quit() { NSApp.terminate(nil) }
+    func applicationWillTerminate(_ notification: Notification) {
+        timeout?.invalidate()
+        channel?.setDelegate(nil)
+        channel?.close()
     }
 }
